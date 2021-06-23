@@ -1,0 +1,176 @@
+---
+title: "powercalcs by simulation"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+Libraries and variable
+
+```{r setup, results='hide', message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(tidyverse)
+library(tibble)
+library(rio)
+library(reshape)
+library(ggplot2)
+library(limma)
+library(truncnorm)
+setwd("./") # set to directory with the code, metadata and data
+```
+
+Useful custom function
+
+```{r functions, results='hide'}
+do_de <- function(sim_ma, group){
+    d = model.matrix(~ group)
+    # y = normalizeBetweenArrays(sim_ma, method = "quantile")
+    y = normalizeBetweenArrays(sim_ma, method = "cyclicloess")
+    f = lmFit(y, d)
+    fb = eBayes(f, robust = TRUE)
+    topTable(fb,coef = "grouptreatment", sort.by = "none", number = Inf)
+}
+```
+
+Do some data munging
+
+```{r dataimport}
+dt = import("data.xlsx") %>% janitor::clean_names() %>% as_tibble()
+dt <- column_to_rownames(dt, "sample_id")
+dt <- t(dt)
+
+meta <- import("meta.xlsx")
+
+# merge metadata into the samplenames
+all(colnames(dt)==meta$sample_id)
+meta$newnames <- paste( meta$group,meta$sample_id, sep="_")
+colnames(dt) <- meta$newnames
+```
+
+Setup simulation comparisons
+- here we we will do all possible pairwise comparisons between the 3 groups
+- we also set the parameters to test in the simulation ie. fold change and sample number
+
+
+```{r variables,results='hide'}
+sampleclasses <- meta %>%  pull(group) %>% unique()
+combos <-  combn(sampleclasses,2) %>% t() %>% as_tibble() 
+# simulate 100x: abs(fc)=1, 1.5, 2, 4 with 5,10,25,50 people each
+sim_fc = c(1, 1.5, 2, 4) # fold changes we are testing in the simulations
+sim_n = c(2,3,4,5,6, 10) # number of samples we will test in the simulations
+```
+
+This is where we run the simulations
+
+
+```{r simulations, echo=FALSE, results='hide'}
+temp <- apply(combos, 1, function(combo){
+  class1 <- paste(combo[1], "_", sep="")
+  class2 <- paste(combo[2], "_", sep="")
+  combo_title <- paste(combo[1], "vs", combo[2],  sep="_")
+  
+  ma = as.data.frame(dt[,c(grep(class1, colnames(dt)), grep(class2, colnames(dt)))])
+  
+  # get variance for each metabolite
+  sd_v = apply(ma,1, sd)
+  m_v = apply(ma,1, mean)
+  # plot(m_v,sd_v)
+  
+  # example how to use it rtruncnorm(n=10, a=0, b=340, mean=39.4, sd=25.09)
+  set.seed(4242)
+  sims = expand.grid(a = sim_fc, b = sim_n)
+  res_sim = apply(sims ,1,function(sim){
+    # print(i)
+    sim <- unlist(sim)
+    lapply(1:100, function(j){
+      # print(j)
+      # pick some random metabolites to be the ones that become DE
+      .de = sample(1:nrow(ma), 4)
+      .up = .de[1:2]
+      .down = .de[3:4]
+      
+      # rtruncnorm will generate random values based on the standard dev and mean 
+       # we set n to be high enough to gie us 2 columns for each n, and the same number of metabolites as the original dataset
+      # then we shove it in a matrix whose column numbers are based on the replicate size
+      df = matrix(rtruncnorm(n=as.numeric(sim[2]*2*nrow(ma)),  
+                             a=0, b=Inf, 
+                             mean = m_v, 
+                             sd = sd_v), 
+                  ncol=as.numeric(sim[2]*2))
+      
+      # here we artificially force the randomly chosen metabolites to have fold changes
+      df[.up, 1:sim[2]] = df[.up, 1:sim[2]] * sim[1]
+      df[.down, 1:sim[2]] = df[.down, 1:sim[2]] / sim[1]
+      
+
+      group = c(rep("control", sim[2]), rep("treatment", sim[2]))
+      res <- do_de(df, group)
+      # print(res)
+      .uprigh = sum(res[.up,"adj.P.Val"] < 0.05)
+      .downrigh = sum(res[.down,"adj.P.Val"] < 0.05)
+      .total = sum(res[,"adj.P.Val"] < 0.05)
+      TP = .uprigh + .downrigh
+      FP = .total - TP
+      data.frame(tp=TP, fp=FP, n=sim[2], fc=sim[1], sim=j)
+    }) %>% bind_rows()
+  }) %>% bind_rows()
+  
+  dfp = res_sim %>% group_by(fc,n) %>%
+    summarise(fpm=mean(fp),tpm=mean(tp), fpsd=sd(fp), tpsd=sd(tp), precision=tpm/(tpm+fpm))
+  
+  needed_replicates <- filter(dfp, precision>0.8) %>% group_by(fc) %>% summarise(min_replicates=min(n))
+  
+  return(list(combo=combo_title, dfp=dfp, reps=needed_replicates))
+})
+```
+
+# Precisions plots
+
+```{r plots}
+
+plot_results <- function(results) {
+  mytitle <- results$combo
+  results$dfp %>% filter(fc!=1) %>%
+    ggplot(aes(x=as.factor(n*2),y=tpm/(tpm+fpm), group=as.factor(fc), color=as.factor(fc))) +
+    geom_line(stat = "identity", size=2) +
+    scale_color_brewer("Fold change", palette = "Set1") +
+    ylim(0,1) +
+    xlab("Number samples") + ylab("PPV") +
+    ggtitle(paste(mytitle, "Precision for lipids at 5% FDR", sep=" - "))
+}
+lapply(temp, plot_results)  
+```
+
+
+# Precision tables
+
+```{r tables, results='asis'}
+table_dfpresults <- function(results){
+  dfp <- filter(results$dfp, fc!=1)  
+  
+  knitr::kable(dfp, caption=results$combo)
+        # , caption=results$combo))
+  # , extensions = 'FixedHeader',
+  # options = list(pageLength = 10, fixedHeader = TRUE))
+}
+
+lapply(temp, table_dfpresults)
+```
+
+# Precision summaries
+- number of replicates needed for 80% precision at the stated fold change
+
+```{r finaltables, results='asis'}
+table_finalresults <- function(results){
+
+  knitr::kable(results$reps, caption=results$combo)
+        # , caption=results$combo))
+  # , extensions = 'FixedHeader',
+  # options = list(pageLength = 10, fixedHeader = TRUE))
+}
+
+lapply(temp, table_finalresults)
+```
+
